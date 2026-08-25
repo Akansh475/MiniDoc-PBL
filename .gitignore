@@ -1,0 +1,14 @@
+# C build artifacts
+*.o
+*.out
+runtime/process_manager
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor junk
+.DS_Store
+.vscode/
