@@ -12,3 +12,8 @@ venv/
 # OS/editor junk
 .DS_Store
 .vscode/
+
+# Database runtime files
+*.db
+*.sqlite
+*.sqlite3
