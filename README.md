@@ -67,7 +67,7 @@ A lightweight, educational container-management system built for a college PBL (
 
 ---
 
-## Entity-Relationship (ER) Diagram
+## Entity-Relationship (ER) Diag
 
 ```mermaid
 erDiagram
