@@ -8,7 +8,7 @@ A lightweight, educational container-management system built for a college PBL (
 
 ## What it does
 
-- Create, start, stop, restart, and delete containers (OS processes).
+- Create,  stop, restart, and delete containers (OS processes).
 - Track process state through a formal lifecycle: `CREATED → RUNNING → STOPPED / EXITED / FAILED`.
 - Persist all container/process metadata, resource telemetry, and lifecycle audit logs in an Oracle relational database (with automatic offline SQLite engine for instant demo).
 - Demonstrate transactional consistency (ACID) between DB state and actual OS state (automatic rollback and cleanup on failure).
