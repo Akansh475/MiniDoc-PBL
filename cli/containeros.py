@@ -599,11 +599,16 @@ def cmd_inspect(args, db: DatabaseManager):
 
         # Sync database if process unexpectedly died
         if not is_alive and c["status"] == "RUNNING":
-            db.sync_status(cid, "EXITED")
-            c["status"] = "EXITED"
+            rt_status = ProcessRuntime.status(pid)
+            real_state = rt_status.get("status", "EXITED")
+            db.sync_status(cid, real_state)
+            c["status"] = real_state
         elif is_alive:
             # Record telemetry in database time-series table
             db.record_usage(cid, cpu_pct, mem_mb)
+
+    # Fetch recent telemetry history from DB
+    history = db.get_resource_history(cid, limit=5)
 
     print("==================================================")
     print(f"Container Inspection: ID {c['container_id']}")
@@ -624,6 +629,12 @@ def cmd_inspect(args, db: DatabaseManager):
     print(f"  Memory (RSS)   : {mem_mb:.2f} MB")
     log_file = f"{LOG_DIR}/proc_{pid}.log"
     print(f"  Runtime Log    : {log_file if os.path.exists(log_file) else 'N/A'}")
+
+    if history:
+        print("---------------- Recent Telemetry ----------------")
+        print(f"  {'TIMESTAMP':<20} {'CPU %':<10} {'MEMORY (MB)'}")
+        for h in history:
+            print(f"  {str(h['recorded_at']):<20} {h['cpu_usage']:<10.2f} {h['memory_usage']:.2f}")
     print("==================================================")
 
 
@@ -635,16 +646,35 @@ def cmd_stop(args, db: DatabaseManager):
         sys.exit(1)
 
     pid = c.get("pid")
-    if c["status"] == "STOPPED":
-        print(f"[*] Container {cid} is already STOPPED.")
+    status = c.get("status")
+
+    if status in ("STOPPED", "EXITED", "FAILED"):
+        print(f"[*] Container {cid} is already {status}. No signal sent.")
         return
 
     print(f"[*] Stopping container {cid} (PID: {pid}) with SIGTERM...")
+    escalated = False
+
     if pid and pid > 0:
         ProcessRuntime.stop(pid)
 
+        # Polling with timeout escalation to SIGKILL (up to 2.5s)
+        for _ in range(25):
+            time.sleep(0.1)
+            st = ProcessRuntime.status(pid)
+            if not st.get("is_alive", False):
+                break
+        else:
+            print(f"[!] Container {cid} (PID: {pid}) did not exit within timeout. Escalating to SIGKILL...")
+            ProcessRuntime.kill(pid)
+            escalated = True
+            time.sleep(0.05)
+
     db.stop_container(cid)
-    print(f"[+] Container {cid} stopped successfully.")
+    if escalated:
+        print(f"[+] Container {cid} forcefully terminated (SIGKILL).")
+    else:
+        print(f"[+] Container {cid} stopped gracefully (SIGTERM).")
 
 
 def cmd_kill(args, db: DatabaseManager):
@@ -655,9 +685,16 @@ def cmd_kill(args, db: DatabaseManager):
         sys.exit(1)
 
     pid = c.get("pid")
+    status = c.get("status")
+
+    if status in ("STOPPED", "EXITED", "FAILED"):
+        print(f"[*] Container {cid} is already {status}. No signal sent.")
+        return
+
     print(f"[*] Force killing container {cid} (PID: {pid}) with SIGKILL...")
     if pid and pid > 0:
         ProcessRuntime.kill(pid)
+        time.sleep(0.05)
 
     db.stop_container(cid)
     print(f"[+] Container {cid} force killed.")
@@ -694,14 +731,63 @@ def cmd_rm(args, db: DatabaseManager):
         print(f"[ERROR] Container ID {cid} not found", file=sys.stderr)
         sys.exit(1)
 
-    if c["status"] == "RUNNING":
+    pid = c.get("pid")
+    if c["status"] == "RUNNING" and pid:
         print(f"[*] Container {cid} is RUNNING. Stopping before removal...")
-        pid = c.get("pid")
-        if pid:
-            ProcessRuntime.stop(pid)
+        ProcessRuntime.stop(pid)
+        time.sleep(0.1)
+        if ProcessRuntime.status(pid).get("is_alive", False):
+            ProcessRuntime.kill(pid)
+            time.sleep(0.05)
 
     db.delete_container(cid)
-    print(f"[+] Container {cid} deleted from database.")
+
+    # Clean up log and metadata files on disk
+    if pid:
+        log_file = f"{LOG_DIR}/proc_{pid}.log"
+        meta_file = f"{LOG_DIR}/proc_{pid}.meta"
+        for p in (log_file, meta_file):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    print(f"[+] Container {cid} removed successfully and artifacts cleaned.")
+
+
+def cmd_stats(args, db: DatabaseManager):
+    target_id = args.container_id
+    if target_id:
+        c = db.get_container(target_id)
+        if not c:
+            print(f"[ERROR] Container ID {target_id} not found", file=sys.stderr)
+            sys.exit(1)
+        containers = [c]
+    else:
+        containers = db.list_containers(all_states=False)
+
+    if not containers:
+        print("No active running containers to monitor.")
+        return
+
+    print(f"{'ID':<6} {'NAME':<18} {'PID':<8} {'CPU %':<10} {'MEM (MB)':<12} {'MEM LIMIT'}")
+    print("-" * 68)
+    for c in containers:
+        cid = c["container_id"]
+        pid = c.get("pid")
+        if not pid:
+            continue
+        metrics = ProcessRuntime.metrics(pid)
+        if metrics.get("is_alive", False):
+            cpu = metrics.get("cpu_usage_pct", 0.0)
+            mem = metrics.get("memory_usage_mb", 0.0)
+            db.record_usage(cid, cpu, mem)
+            mem_limit = f"{c['memory_limit'] / (1024*1024):.1f} MB" if c.get("memory_limit", 0) > 0 else "unlimited"
+            print(f"{cid:<6} {c['container_name']:<18} {pid:<8} {cpu:<10.2f} {mem:<12.2f} {mem_limit}")
+        else:
+            db.sync_status(cid, "EXITED")
+            print(f"{cid:<6} {c['container_name']:<18} {pid:<8} {'--':<10} {'--':<12} (Process exited)")
 
 
 def cmd_logs(args, db: DatabaseManager):
@@ -780,6 +866,10 @@ def main():
     p_rm = subparsers.add_parser("rm", help="Remove container and delete database records")
     p_rm.add_argument("container_id", type=int, help="Target container ID")
 
+    # stats
+    p_stats = subparsers.add_parser("stats", help="Display live resource telemetry (CPU/Memory) for containers")
+    p_stats.add_argument("container_id", type=int, nargs="?", default=None, help="Target container ID (optional)")
+
     # logs
     p_logs = subparsers.add_parser("logs", help="View lifecycle transition audit trail")
     p_logs.add_argument("container_id", type=int, help="Target container ID")
@@ -799,6 +889,8 @@ def main():
         cmd_ps(args, db)
     elif args.subcommand == "inspect":
         cmd_inspect(args, db)
+    elif args.subcommand == "stats":
+        cmd_stats(args, db)
     elif args.subcommand == "stop":
         cmd_stop(args, db)
     elif args.subcommand == "kill":
