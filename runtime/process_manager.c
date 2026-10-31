@@ -129,6 +129,15 @@ pid_t launch_process(const char* command, const ResourceLimits* limits, char* er
         // Detach session from caller terminal
         setsid();
 
+        // Redirect supervisor standard streams to /dev/null so parent stdout/stderr EOF immediately
+        int devnull_sup = open("/dev/null", O_RDWR);
+        if (devnull_sup >= 0) {
+            dup2(devnull_sup, STDIN_FILENO);
+            dup2(devnull_sup, STDOUT_FILENO);
+            dup2(devnull_sup, STDERR_FILENO);
+            if (devnull_sup > 2) close(devnull_sup);
+        }
+
         // Pipe to synchronously detect child exec failure
         int exec_pipe[2];
         if (pipe(exec_pipe) < 0) {

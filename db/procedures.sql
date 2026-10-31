@@ -17,6 +17,7 @@ CREATE OR REPLACE PACKAGE minidocker_pkg AS
         p_cpu_limit    IN  NUMBER,
         p_memory_limit IN  NUMBER,
         p_pid          IN  NUMBER,
+        p_user_id      IN  NUMBER DEFAULT 1,
         p_container_id OUT NUMBER,
         p_status       OUT VARCHAR2
     );
@@ -83,6 +84,7 @@ CREATE OR REPLACE PACKAGE BODY minidocker_pkg AS
         p_cpu_limit    IN  NUMBER,
         p_memory_limit IN  NUMBER,
         p_pid          IN  NUMBER,
+        p_user_id      IN  NUMBER DEFAULT 1,
         p_container_id OUT NUMBER,
         p_status       OUT VARCHAR2
     ) IS
@@ -102,6 +104,7 @@ CREATE OR REPLACE PACKAGE BODY minidocker_pkg AS
         END IF;
 
         INSERT INTO containers (
+            user_id,
             container_name,
             command,
             pid,
@@ -111,6 +114,7 @@ CREATE OR REPLACE PACKAGE BODY minidocker_pkg AS
             created_at,
             updated_at
         ) VALUES (
+            NVL(p_user_id, 1),
             p_name,
             p_command,
             p_pid,

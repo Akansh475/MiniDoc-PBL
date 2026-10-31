@@ -161,13 +161,25 @@ class DatabaseManager:
     def _init_sqlite(self):
         self.mode = "SQLITE"
         os.makedirs(os.path.dirname(DEFAULT_SQLITE_DB), exist_ok=True)
-        is_new = not os.path.exists(DEFAULT_SQLITE_DB)
         self.sqlite_conn = sqlite3.connect(DEFAULT_SQLITE_DB, timeout=30.0)
         self.sqlite_conn.row_factory = sqlite3.Row
         self.sqlite_conn.execute("PRAGMA foreign_keys = ON;")
+        self._migrate_sqlite_schema()
+        self._create_sqlite_schema()
 
-        if is_new:
-            self._create_sqlite_schema()
+    def _migrate_sqlite_schema(self):
+        """Ensures schema upgrades (e.g. user_id foreign key) apply to existing databases."""
+        cur = self.sqlite_conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='containers';")
+        if cur.fetchone():
+            cur.execute("PRAGMA table_info(containers);")
+            columns = [row[1] for row in cur.fetchall()]
+            if "user_id" not in columns:
+                try:
+                    cur.execute("ALTER TABLE containers ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1 REFERENCES users(user_id) ON DELETE CASCADE;")
+                    self.sqlite_conn.commit()
+                except Exception:
+                    pass
 
     def _create_sqlite_schema(self):
         cur = self.sqlite_conn.cursor()
@@ -180,6 +192,7 @@ class DatabaseManager:
 
             CREATE TABLE IF NOT EXISTS containers (
                 container_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 1 REFERENCES users(user_id) ON DELETE CASCADE,
                 container_name TEXT UNIQUE NOT NULL,
                 command TEXT NOT NULL,
                 pid INTEGER,
@@ -207,13 +220,54 @@ class DatabaseManager:
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE INDEX IF NOT EXISTS idx_containers_user_id ON containers(user_id);
             CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status);
             CREATE INDEX IF NOT EXISTS idx_containers_pid ON containers(pid);
             CREATE INDEX IF NOT EXISTS idx_process_logs_cid ON process_logs(container_id);
             CREATE INDEX IF NOT EXISTS idx_resource_usage_cid ON resource_usage(container_id);
 
             -- Default Admin User
-            INSERT INTO users (username) VALUES ('admin');
+            INSERT OR IGNORE INTO users (user_id, username) VALUES (1, 'admin');
+
+            -- Automated Audit Triggers (Parity with Oracle triggers.sql)
+            CREATE TRIGGER IF NOT EXISTS trg_container_created_log
+            AFTER INSERT ON containers
+            FOR EACH ROW
+            BEGIN
+                INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
+                VALUES (NEW.container_id, 'CONTAINER_CREATED', NULL, NEW.status, datetime('now'));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_container_created_running_log
+            AFTER INSERT ON containers
+            FOR EACH ROW
+            WHEN NEW.status = 'RUNNING'
+            BEGIN
+                INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
+                VALUES (NEW.container_id, 'CONTAINER_STARTED', 'CREATED', 'RUNNING', datetime('now'));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_container_status_log
+            AFTER UPDATE OF status ON containers
+            FOR EACH ROW
+            WHEN OLD.status != NEW.status
+            BEGIN
+                INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
+                VALUES (
+                    NEW.container_id,
+                    CASE
+                        WHEN OLD.status = 'CREATED' AND NEW.status = 'RUNNING' THEN 'CONTAINER_STARTED'
+                        WHEN OLD.status = 'RUNNING' AND NEW.status = 'STOPPED' THEN 'CONTAINER_STOPPED'
+                        WHEN OLD.status = 'STOPPED' AND NEW.status = 'RUNNING' THEN 'CONTAINER_RESTARTED'
+                        WHEN OLD.status = 'RUNNING' AND NEW.status = 'EXITED' THEN 'CONTAINER_COMPLETED'
+                        WHEN NEW.status = 'FAILED' THEN 'CONTAINER_CRASHED_OR_FAILED'
+                        ELSE 'STATUS_CHANGED_TO_' || NEW.status
+                    END,
+                    OLD.status,
+                    NEW.status,
+                    datetime('now')
+                );
+            END;
         """)
         self.sqlite_conn.commit()
 
@@ -221,7 +275,7 @@ class DatabaseManager:
     # CONTAINER CRUD & STORED PROCEDURES IMPLEMENTATION
     # ------------------------------------------------------------------------
 
-    def create_container(self, name: str, command: str, pid: int, cpu_limit: int, mem_limit: int) -> int:
+    def create_container(self, name: str, command: str, pid: int, cpu_limit: int, mem_limit: int, user_id: int = 1) -> int:
         """Atomically inserts container and logs CREATED / RUNNING state."""
         status = "RUNNING" if (pid and pid > 0) else "CREATED"
 
@@ -229,7 +283,7 @@ class DatabaseManager:
             cur = self.oracle_conn.cursor()
             p_id = cur.var(int)
             p_st = cur.var(str)
-            cur.callproc("minidocker_pkg.create_container", [name, command, cpu_limit, mem_limit, pid, p_id, p_st])
+            cur.callproc("minidocker_pkg.create_container", [name, command, cpu_limit, mem_limit, pid, user_id, p_id, p_st])
             self.oracle_conn.commit()
             return p_id.getvalue()
         else:
@@ -237,23 +291,10 @@ class DatabaseManager:
             try:
                 cur.execute("BEGIN IMMEDIATE;")
                 cur.execute("""
-                    INSERT INTO containers (container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-                """, (name, command, pid, status, cpu_limit, mem_limit))
+                    INSERT INTO containers (user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                """, (user_id, name, command, pid, status, cpu_limit, mem_limit))
                 cid = cur.lastrowid
-
-                # Trigger simulation for process_logs
-                cur.execute("""
-                    INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
-                    VALUES (?, 'CONTAINER_CREATED', NULL, ?, datetime('now'))
-                """, (cid, status))
-
-                if status == "RUNNING":
-                    cur.execute("""
-                        INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
-                        VALUES (?, 'CONTAINER_STARTED', 'CREATED', 'RUNNING', datetime('now'))
-                    """, (cid,))
-
                 self.sqlite_conn.commit()
                 return cid
             except Exception as e:
@@ -319,11 +360,6 @@ class DatabaseManager:
                     SET status = 'STOPPED', updated_at = datetime('now')
                     WHERE container_id = ?
                 """, (container_id,))
-                cur.execute("""
-                    INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
-                    VALUES (?, 'CONTAINER_STOPPED', ?, 'STOPPED', datetime('now'))
-                """, (container_id, old_st))
-
             self.sqlite_conn.commit()
             return "STOPPED"
 
@@ -343,18 +379,11 @@ class DatabaseManager:
                 self.sqlite_conn.rollback()
                 raise ValueError(f"Container ID {container_id} not found")
 
-            old_st = row["status"]
             cur.execute("""
                 UPDATE containers
                 SET pid = ?, status = 'RUNNING', updated_at = datetime('now')
                 WHERE container_id = ?
             """, (new_pid, container_id))
-
-            cur.execute("""
-                INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
-                VALUES (?, 'CONTAINER_RESTARTED', ?, 'RUNNING', datetime('now'))
-            """, (container_id, old_st))
-
             self.sqlite_conn.commit()
             return "RUNNING"
 
@@ -382,21 +411,16 @@ class DatabaseManager:
             self.oracle_conn.commit()
         else:
             cur = self.sqlite_conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
             cur.execute("SELECT status FROM containers WHERE container_id = ?", (container_id,))
             row = cur.fetchone()
             if row and row["status"] != real_status:
-                old_st = row["status"]
                 cur.execute("""
                     UPDATE containers
                     SET status = ?, updated_at = datetime('now')
                     WHERE container_id = ?
                 """, (real_status, container_id))
-                action = "CONTAINER_COMPLETED" if real_status == "EXITED" else "CONTAINER_CRASHED_OR_FAILED"
-                cur.execute("""
-                    INSERT INTO process_logs (container_id, action, old_status, new_status, timestamp)
-                    VALUES (?, ?, ?, ?, datetime('now'))
-                """, (container_id, action, old_st, real_status))
-                self.sqlite_conn.commit()
+            self.sqlite_conn.commit()
 
     def record_usage(self, container_id: int, cpu_usage: float, mem_usage: float):
         if self.mode == "ORACLE":
@@ -410,6 +434,29 @@ class DatabaseManager:
                 VALUES (?, ?, ?, datetime('now'))
             """, (container_id, cpu_usage, mem_usage))
             self.sqlite_conn.commit()
+
+    def get_resource_history(self, container_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+        query = """
+            SELECT usage_id, container_id, cpu_usage, memory_usage, recorded_at
+            FROM resource_usage
+            WHERE container_id = ?
+            ORDER BY usage_id DESC
+            LIMIT ?
+        """
+        if self.mode == "ORACLE":
+            cur = self.oracle_conn.cursor()
+            cur.execute("""
+                SELECT usage_id, container_id, cpu_usage, memory_usage, TO_CHAR(recorded_at, 'YYYY-MM-DD HH24:MI:SS') as recorded_at
+                FROM (
+                    SELECT * FROM resource_usage WHERE container_id = :1 ORDER BY usage_id DESC
+                ) WHERE ROWNUM <= :2
+            """, [container_id, limit])
+            cols = [col[0].lower() for col in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        else:
+            cur = self.sqlite_conn.cursor()
+            cur.execute(query, (container_id, limit))
+            return [dict(row) for row in cur.fetchall()]
 
     def get_logs(self, container_id: int) -> List[Dict[str, Any]]:
         query = """

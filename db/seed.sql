@@ -36,8 +36,9 @@ VALUES ('qa_tester', SYSTIMESTAMP - INTERVAL '1' DAY);
 
 -- Container 1: Web API service (RUNNING)
 INSERT INTO containers (
-    container_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
+    container_id, user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
 ) VALUES (
+    1,
     1,
     'web-api',
     'python3 -m http.server 8080',
@@ -51,8 +52,9 @@ INSERT INTO containers (
 
 -- Container 2: Background worker (STOPPED)
 INSERT INTO containers (
-    container_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
+    container_id, user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
 ) VALUES (
+    2,
     2,
     'queue-worker',
     'python3 worker.py --concurrency=2',
@@ -66,8 +68,9 @@ INSERT INTO containers (
 
 -- Container 3: Batch export job (EXITED successfully)
 INSERT INTO containers (
-    container_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
+    container_id, user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
 ) VALUES (
+    3,
     3,
     'batch-exporter',
     'python3 export_data.py --format=csv',
@@ -81,9 +84,10 @@ INSERT INTO containers (
 
 -- Container 4: Faulty microservice (FAILED)
 INSERT INTO containers (
-    container_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
+    container_id, user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
 ) VALUES (
     4,
+    1,
     'faulty-service',
     '/usr/local/bin/non_existent_app',
     NULL,
@@ -96,9 +100,10 @@ INSERT INTO containers (
 
 -- Container 5: Template staging container (CREATED)
 INSERT INTO containers (
-    container_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
+    container_id, user_id, container_name, command, pid, status, cpu_limit, memory_limit, created_at, updated_at
 ) VALUES (
     5,
+    2,
     'db-backup-staging',
     'sh run_backup.sh --full',
     NULL,
