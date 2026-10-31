@@ -54,7 +54,7 @@ static void trim_newline(char* str) {
     }
 }
 
-/* Ensure directory exists for logging child processes */
+/* Ensure directory exists for logging and metadata */
 static void ensure_log_dir() {
     struct stat st = {0};
     if (stat(DEFAULT_LOG_DIR, &st) == -1) {
@@ -62,9 +62,40 @@ static void ensure_log_dir() {
     }
 }
 
+/* Write terminal process metadata (.meta) upon child workload exit */
+static void write_meta_file(pid_t pid, int status) {
+    char meta_path[256];
+    snprintf(meta_path, sizeof(meta_path), "%s/proc_%d.meta", DEFAULT_LOG_DIR, pid);
+    FILE* fp = fopen(meta_path, "w");
+    if (!fp) return;
+
+    int exit_code = 0;
+    int term_sig = 0;
+    const char* state_str = "EXITED";
+
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+        state_str = (exit_code == 0) ? "EXITED" : "FAILED";
+    } else if (WIFSIGNALED(status)) {
+        term_sig = WTERMSIG(status);
+        exit_code = 128 + term_sig;
+        if (term_sig == SIGTERM || term_sig == SIGKILL) {
+            state_str = "STOPPED";
+        } else {
+            state_str = "FAILED";
+        }
+    }
+
+    fprintf(fp, "exit_code=%d\nterm_sig=%d\nstatus=%s\n", exit_code, term_sig, state_str);
+    fflush(fp);
+    fclose(fp);
+}
+
 /**
  * Launch a background command with resource limits.
- * Uses pipe with FD_CLOEXEC to synchronously catch exec errors.
+ * Employs a dedicated supervisor process that detaches via setsid(),
+ * executes the workload in its own process group, monitors child termination,
+ * and records exact exit codes and signals into a .meta file.
  */
 pid_t launch_process(const char* command, const ResourceLimits* limits, char* error_out, size_t err_len) {
     if (!command || strlen(command) == 0) {
@@ -74,125 +105,187 @@ pid_t launch_process(const char* command, const ResourceLimits* limits, char* er
 
     ensure_log_dir();
 
-    // Pipe for communicating execvp failure from child to parent
-    int exec_pipe[2];
-    if (pipe(exec_pipe) < 0) {
-        snprintf(error_out, err_len, "Failed to create error pipe: %s", strerror(errno));
+    // Pipe for supervisor to report child PID and early errors to caller
+    int notify_pipe[2];
+    if (pipe(notify_pipe) < 0) {
+        snprintf(error_out, err_len, "Failed to create notify pipe: %s", strerror(errno));
         return -1;
     }
 
-    // Set close-on-exec on write-end so pipe closes automatically if exec succeeds
-    int flags = fcntl(exec_pipe[1], F_GETFD);
-    if (flags >= 0) {
-        fcntl(exec_pipe[1], F_SETFD, flags | FD_CLOEXEC);
-    }
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        // Fork failed
-        snprintf(error_out, err_len, "fork() failed: %s", strerror(errno));
-        close(exec_pipe[0]);
-        close(exec_pipe[1]);
+    pid_t supervisor_pid = fork();
+    if (supervisor_pid < 0) {
+        snprintf(error_out, err_len, "Failed to fork supervisor: %s", strerror(errno));
+        close(notify_pipe[0]);
+        close(notify_pipe[1]);
         return -1;
     }
 
-    if (pid == 0) {
+    if (supervisor_pid == 0) {
         // ==========================================
-        // CHILD PROCESS
+        // SUPERVISOR PROCESS
         // ==========================================
-        close(exec_pipe[0]); // Close unused read-end
+        close(notify_pipe[0]); // Close read end
 
-        // 1. Create a new session to detach from parent terminal
+        // Detach session from caller terminal
         setsid();
 
-        // 2. Apply CPU Resource Limit via setrlimit()
-        if (limits && limits->cpu_limit_seconds > 0) {
-            struct rlimit rl_cpu;
-            rl_cpu.rlim_cur = limits->cpu_limit_seconds;
-            rl_cpu.rlim_max = limits->cpu_limit_seconds;
-            if (setrlimit(RLIMIT_CPU, &rl_cpu) != 0) {
-                // Warning, but proceed
+        // Pipe to synchronously detect child exec failure
+        int exec_pipe[2];
+        if (pipe(exec_pipe) < 0) {
+            int err = -1;
+            write(notify_pipe[1], &err, sizeof(err));
+            close(notify_pipe[1]);
+            _exit(1);
+        }
+        int flags = fcntl(exec_pipe[1], F_GETFD);
+        if (flags >= 0) {
+            fcntl(exec_pipe[1], F_SETFD, flags | FD_CLOEXEC);
+        }
+
+        pid_t child_pid = fork();
+        if (child_pid < 0) {
+            int err = -1;
+            write(notify_pipe[1], &err, sizeof(err));
+            close(exec_pipe[0]);
+            close(exec_pipe[1]);
+            close(notify_pipe[1]);
+            _exit(1);
+        }
+
+        if (child_pid == 0) {
+            // ==========================================
+            // CHILD WORKLOAD PROCESS
+            // ==========================================
+            close(notify_pipe[1]);
+            close(exec_pipe[0]);
+
+            // Set process group ID to own PID for group signal propagation
+            setpgid(0, 0);
+
+            // 1. Apply CPU Resource Limit via setrlimit()
+            if (limits && limits->cpu_limit_seconds > 0) {
+                struct rlimit rl_cpu;
+                rl_cpu.rlim_cur = limits->cpu_limit_seconds;
+                rl_cpu.rlim_max = limits->cpu_limit_seconds;
+                setrlimit(RLIMIT_CPU, &rl_cpu);
+            }
+
+            // 2. Apply Memory Resource Limit via setrlimit()
+            if (limits && limits->mem_limit_bytes > 0) {
+                struct rlimit rl_mem;
+                rl_mem.rlim_cur = limits->mem_limit_bytes;
+                rl_mem.rlim_max = limits->mem_limit_bytes;
+#if defined(RLIMIT_AS)
+                setrlimit(RLIMIT_AS, &rl_mem);
+#elif defined(RLIMIT_DATA)
+                setrlimit(RLIMIT_DATA, &rl_mem);
+#endif
+            }
+
+            // 3. Redirect standard input to /dev/null
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+
+            // 4. Redirect stdout & stderr to log file: /tmp/minidocker_logs/proc_<PID>.log
+            char log_path[256];
+            snprintf(log_path, sizeof(log_path), "%s/proc_%d.log", DEFAULT_LOG_DIR, getpid());
+            int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (log_fd >= 0) {
+                dup2(log_fd, STDOUT_FILENO);
+                dup2(log_fd, STDERR_FILENO);
+                close(log_fd);
+            }
+
+            // 5. Execute command using POSIX shell
+            execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+
+            // If exec fails, send errno through pipe and exit
+            int err = errno;
+            write(exec_pipe[1], &err, sizeof(err));
+            close(exec_pipe[1]);
+            _exit(127);
+        }
+
+        // Supervisor handling child setup
+        close(exec_pipe[1]);
+        setpgid(child_pid, child_pid);
+
+        // Check if child exec failed immediately
+        int child_errno = 0;
+        ssize_t bytes_read = read(exec_pipe[0], &child_errno, sizeof(child_errno));
+        close(exec_pipe[0]);
+
+        if (bytes_read > 0 && child_errno != 0) {
+            int fail_sig = -1;
+            write(notify_pipe[1], &fail_sig, sizeof(fail_sig));
+            close(notify_pipe[1]);
+            int st;
+            waitpid(child_pid, &st, 0);
+            _exit(1);
+        }
+
+        // Small delay (50ms) to detect immediate startup crashes
+        usleep(50000); // 50ms
+        int st = 0;
+        pid_t check_res = waitpid(child_pid, &st, WNOHANG);
+
+        if (check_res == child_pid) {
+            // Child already finished in under 50ms
+            write_meta_file(child_pid, st);
+            if ((WIFEXITED(st) && WEXITSTATUS(st) != 0) || WIFSIGNALED(st)) {
+                // Immediate failure: notify parent with -2
+                int fail_sig = -2;
+                write(notify_pipe[1], &fail_sig, sizeof(fail_sig));
+                close(notify_pipe[1]);
+                _exit(1);
             }
         }
 
-        // 3. Apply Memory Resource Limit via setrlimit()
-        if (limits && limits->mem_limit_bytes > 0) {
-            struct rlimit rl_mem;
-            rl_mem.rlim_cur = limits->mem_limit_bytes;
-            rl_mem.rlim_max = limits->mem_limit_bytes;
-#if defined(RLIMIT_AS)
-            setrlimit(RLIMIT_AS, &rl_mem);
-#elif defined(RLIMIT_DATA)
-            setrlimit(RLIMIT_DATA, &rl_mem);
-#endif
+        // Child is alive (or cleanly finished 0); notify caller with child_pid
+        write(notify_pipe[1], &child_pid, sizeof(child_pid));
+        close(notify_pipe[1]);
+
+        // If child already exited 0 within 50ms, supervisor work is done
+        if (check_res == child_pid) {
+            _exit(0);
         }
 
-        // 4. Redirect standard input to /dev/null
-        int devnull = open("/dev/null", O_RDONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            close(devnull);
-        }
-
-        // 5. Redirect stdout & stderr to log file: /tmp/minidocker_logs/proc_<PID>.log
-        char log_path[256];
-        snprintf(log_path, sizeof(log_path), "%s/proc_%d.log", DEFAULT_LOG_DIR, getpid());
-        int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (log_fd >= 0) {
-            dup2(log_fd, STDOUT_FILENO);
-            dup2(log_fd, STDERR_FILENO);
-            close(log_fd);
-        }
-
-        // 6. Execute command using POSIX shell
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
-
-        // If exec fails, send errno through pipe to parent and exit
-        int err = errno;
-        write(exec_pipe[1], &err, sizeof(err));
-        close(exec_pipe[1]);
-        _exit(127);
+        // Supervisor remains running to reap child and record exit code
+        waitpid(child_pid, &st, 0);
+        write_meta_file(child_pid, st);
+        _exit(0);
     }
 
     // ==========================================
-    // PARENT PROCESS
+    // PARENT PROCESS (CLI CALLER)
     // ==========================================
-    close(exec_pipe[1]); // Close unused write-end
+    close(notify_pipe[1]);
 
-    // Read error code from child (if exec failed)
-    int child_errno = 0;
-    ssize_t bytes_read = read(exec_pipe[0], &child_errno, sizeof(child_errno));
-    close(exec_pipe[0]);
+    pid_t workload_pid = -1;
+    ssize_t nr = read(notify_pipe[0], &workload_pid, sizeof(workload_pid));
+    close(notify_pipe[0]);
 
-    if (bytes_read > 0 && child_errno != 0) {
-        // Child failed during exec
-        snprintf(error_out, err_len, "Child exec() failed: %s", strerror(child_errno));
-        int status;
-        waitpid(pid, &status, 0); // Reap zombie
+    int sup_st;
+    waitpid(supervisor_pid, &sup_st, WNOHANG);
+
+    if (nr <= 0 || workload_pid <= 0) {
+        if (workload_pid == -2) {
+            snprintf(error_out, err_len, "Process exited or crashed immediately upon launch");
+        } else {
+            snprintf(error_out, err_len, "Failed to spawn child workload");
+        }
         return -1;
     }
 
-    // Small delay to verify child didn't crash instantaneously
-    usleep(50000); // 50ms
-
-    int status;
-    pid_t result = waitpid(pid, &status, WNOHANG);
-    if (result == pid) {
-        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-            snprintf(error_out, err_len, "Process exited immediately with code %d", WEXITSTATUS(status));
-            return -1;
-        } else if (WIFSIGNALED(status)) {
-            snprintf(error_out, err_len, "Process terminated immediately by signal %d", WTERMSIG(status));
-            return -1;
-        }
-    }
-
-    return pid;
+    return workload_pid;
 }
 
 /**
  * Stop or Kill a process using POSIX signals (SIGTERM or SIGKILL).
+ * Targets the process group (-pid) with fallback to individual PID.
  */
 bool stop_process(pid_t pid, int sig, char* error_out, size_t err_len) {
     if (pid <= 1) {
@@ -200,7 +293,13 @@ bool stop_process(pid_t pid, int sig, char* error_out, size_t err_len) {
         return false;
     }
 
-    if (kill(pid, sig) != 0) {
+    // Try sending to process group first
+    int res = kill(-pid, sig);
+    if (res != 0) {
+        res = kill(pid, sig);
+    }
+
+    if (res != 0) {
         if (errno == ESRCH) {
             snprintf(error_out, err_len, "Process PID %d does not exist (already dead)", pid);
         } else if (errno == EPERM) {
@@ -211,47 +310,47 @@ bool stop_process(pid_t pid, int sig, char* error_out, size_t err_len) {
         return false;
     }
 
-    // Give process brief moment to terminate and reap if child
-    int status;
-    waitpid(pid, &status, WNOHANG);
     return true;
 }
 
 /**
- * Check process state.
- * Returns RUNNING, STOPPED, EXITED, or FAILED.
+ * Check process state and retrieve exact exit code if terminated.
+ * If process has exited, reads metadata written by the supervisor.
  */
 ProcessState check_process_status(pid_t pid, int* exit_code_out) {
     if (exit_code_out) *exit_code_out = 0;
     if (pid <= 0) return STATE_FAILED;
 
-    int status;
-    pid_t wait_res = waitpid(pid, &status, WNOHANG);
+    // Check if process is still active in the OS process table
+    if (kill(pid, 0) == 0) {
+        return STATE_RUNNING;
+    }
 
-    if (wait_res == pid) {
-        if (WIFEXITED(status)) {
-            int code = WEXITSTATUS(status);
-            if (exit_code_out) *exit_code_out = code;
-            return (code == 0) ? STATE_EXITED : STATE_FAILED;
-        } else if (WIFSIGNALED(status)) {
-            int sig = WTERMSIG(status);
-            if (exit_code_out) *exit_code_out = 128 + sig;
-            return STATE_STOPPED;
+    // Process is no longer running; inspect supervisor metadata file
+    char meta_path[256];
+    snprintf(meta_path, sizeof(meta_path), "%s/proc_%d.meta", DEFAULT_LOG_DIR, pid);
+    FILE* fp = fopen(meta_path, "r");
+    if (fp) {
+        char line[128];
+        int code = 0;
+        char status_str[32] = {0};
+
+        while (fgets(line, sizeof(line), fp)) {
+            if (sscanf(line, "exit_code=%d", &code) == 1) {
+                if (exit_code_out) *exit_code_out = code;
+            } else if (sscanf(line, "status=%31s", status_str) == 1) {
+                // Read state
+            }
+        }
+        fclose(fp);
+
+        if (status_str[0]) {
+            return string_to_state(status_str);
         }
     }
 
-    // If waitpid returned 0 (still running) or -1 with ECHILD (not a direct child)
-    // Check existence via kill(pid, 0)
-    if (kill(pid, 0) == 0) {
-        return STATE_RUNNING;
-    } else {
-        if (errno == ESRCH) {
-            // Process no longer exists in OS process table
-            return STATE_EXITED;
-        } else if (errno == EPERM) {
-            // Process exists but belongs to another user
-            return STATE_RUNNING;
-        }
+    if (errno == ESRCH) {
+        return STATE_EXITED;
     }
 
     return STATE_FAILED;
@@ -306,7 +405,6 @@ int main(int argc, char* argv[]) {
     char error_buf[MAX_ERR_LEN] = {0};
 
     if (strcmp(action, "run") == 0) {
-        // Usage: process_manager run <cpu_limit_sec> <mem_limit_bytes> "<command>"
         if (argc < 5) {
             printf("{\n  \"status\": \"FAILED\",\n  \"error\": \"Missing arguments: run <cpu_sec> <mem_bytes> <cmd>\"\n}\n");
             return 1;
@@ -337,7 +435,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     } else if (strcmp(action, "status") == 0) {
-        // Usage: process_manager status <pid>
         if (argc < 3) {
             printf("{\n  \"error\": \"Missing PID for status\"\n}\n");
             return 1;
@@ -354,7 +451,6 @@ int main(int argc, char* argv[]) {
         printf("}\n");
         return 0;
     } else if (strcmp(action, "stop") == 0) {
-        // Usage: process_manager stop <pid>
         if (argc < 3) {
             printf("{\n  \"error\": \"Missing PID for stop\"\n}\n");
             return 1;
@@ -375,7 +471,6 @@ int main(int argc, char* argv[]) {
         printf("}\n");
         return ok ? 0 : 1;
     } else if (strcmp(action, "kill") == 0) {
-        // Usage: process_manager kill <pid>
         if (argc < 3) {
             printf("{\n  \"error\": \"Missing PID for kill\"\n}\n");
             return 1;
@@ -396,7 +491,6 @@ int main(int argc, char* argv[]) {
         printf("}\n");
         return ok ? 0 : 1;
     } else if (strcmp(action, "restart") == 0) {
-        // Usage: process_manager restart <old_pid> <cpu_sec> <mem_bytes> "<command>"
         if (argc < 6) {
             printf("{\n  \"status\": \"FAILED\",\n  \"error\": \"Missing args: restart <old_pid> <cpu> <mem> <cmd>\"\n}\n");
             return 1;
@@ -437,7 +531,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     } else if (strcmp(action, "metrics") == 0) {
-        // Usage: process_manager metrics <pid>
         if (argc < 3) {
             printf("{\n  \"error\": \"Missing PID for metrics\"\n}\n");
             return 1;
