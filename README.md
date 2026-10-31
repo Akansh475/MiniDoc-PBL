@@ -67,7 +67,7 @@ A lightweight, educational container-management system built for a college PBL (
 
 ---
 
-## Entity-Relationship (ER) Diag
+## Entity-Relationship (ER) Diagram
 
 ```mermaid
 erDiagram
@@ -83,6 +83,7 @@ erDiagram
 
     CONTAINERS {
         number container_id PK
+        number user_id FK
         varchar2 container_name UK
         varchar2 command
         number pid
@@ -123,12 +124,14 @@ MiniDoc-PBL/
 │   ├── triggers.sql         # PL/SQL: Automated audit triggers
 │   ├── seed.sql             # Comprehensive seed data for viva demo
 │   └── concurrency_demo.sql # Two-session concurrency & row-locking viva script
-├── runtime/                 # C: Low-level process creation & syscalls
-│   ├── process_manager.c    # fork, execvp, waitpid, signals, setrlimit
+├── runtime/                 # C: Low-level process supervisor & POSIX syscalls
+│   ├── process_manager.c    # fork, setsid, waitpid, signals, setrlimit, meta files
 │   ├── process_manager.h    # Header definitions & data structures
 │   └── Makefile             # GCC compilation rules
 ├── cli/                     # Python CLI orchestration layer
-│   └── containeros.py       # User CLI commands & DB adapter
+│   └── containeros.py       # User CLI commands & dual-engine DB adapter
+├── tests/                   # Automated regression test suite
+│   └── test_lifecycle.py    # End-to-end lifecycle, signals, rollback & DBMS tests
 ├── docs/
 │   └── report.md            # Comprehensive academic PBL report
 ├── .gitignore               # Git ignore rules (binaries, databases, caches)
@@ -157,13 +160,20 @@ make -C runtime
 | `run` | Launch a tracked background container workload | `python3 cli/containeros.py run "sleep 60" --name worker1 --cpu 10` |
 | `ps` | List running containers (`-a` for all states) | `python3 cli/containeros.py ps -a` |
 | `inspect` | Display metadata, PID, and live resource telemetry | `python3 cli/containeros.py inspect 1` |
-| `stop` | Gracefully terminate container with `SIGTERM` | `python3 cli/containeros.py stop 1` |
+| `stats` | Display real-time CPU % and Memory RSS consumption | `python3 cli/containeros.py stats [id]` |
+| `stop` | Gracefully terminate container with `SIGTERM` (escalates to `SIGKILL`) | `python3 cli/containeros.py stop 1` |
 | `kill` | Forcefully terminate container with `SIGKILL` | `python3 cli/containeros.py kill 1` |
 | `restart` | Restart a workload with a fresh OS PID | `python3 cli/containeros.py restart 1` |
-| `rm` | Remove container (cascading delete in DB) | `python3 cli/containeros.py rm 1` |
+| `rm` | Remove container (cascading delete in DB & disk cleanup) | `python3 cli/containeros.py rm 1` |
 | `logs` | View state transition audit trail and process output | `python3 cli/containeros.py logs 1 --output` |
 
-### 4. Running the Concurrency & Row Locking Demo
+### 4. Running the Automated Test Suite
+To verify end-to-end lifecycle operations, exit-code capture, and DBMS ACID constraints:
+```bash
+python3 -m unittest discover tests
+```
+
+### 5. Running the Concurrency & Row Locking Demo
 To demonstrate Oracle concurrency control and row-level locks during viva:
 ```bash
 # Connect to SQL*Plus or SQL Developer and execute:
