@@ -11,7 +11,7 @@ Integrates:
   with an automatic embedded offline engine for instant portability and viva demo.
 
 Supported Commands:
-  containeros run "<command>" [--name <name>] [--cpu <sec>] [--memory <bytes>]
+  containeros run <command> [args...] [--name <name>] [--cpu <sec>] [--memory <bytes>]
   containeros ps [--all]
   containeros inspect <container_id>
   containeros stop <container_id>
@@ -25,6 +25,7 @@ import sys
 import os
 import json
 import argparse
+import shlex
 import subprocess
 import sqlite3
 import datetime
@@ -826,9 +827,94 @@ def cmd_logs(args, db: DatabaseManager):
 
 
 # ============================================================================
+# `run` ARGUMENT PARSING
+# ============================================================================
+# containeros's own options for `run`. Each takes exactly one value.
+RUN_VALUE_OPTIONS = ("--name", "--cpu", "--memory")
+
+
+def _is_run_option(token: str) -> bool:
+    """True for `--name` as well as the `--name=value` spelling."""
+    return token in RUN_VALUE_OPTIONS or any(token.startswith(opt + "=") for opt in RUN_VALUE_OPTIONS)
+
+
+def split_run_args(tokens: List[str]):
+    """
+    Splits everything typed after `run` into (containeros options, workload command).
+
+    The workload command is taken exactly as the user typed it, so it no longer
+    has to be wrapped in quotes and may carry its own flags:
+
+        run sleep 60 --name worker1        -> opts: --name worker1 | cmd: sleep 60
+        run --cpu 10 ls -la /tmp           -> opts: --cpu 10       | cmd: ls -la /tmp
+        run "sleep 1; exit 42" --name x    -> opts: --name x       | cmd: sleep 1; exit 42
+        run --name x -- tool --name y      -> opts: --name x       | cmd: tool --name y
+
+    containeros options are recognised only before the command and at the very
+    end of the line; anything in between belongs to the workload. A literal `--`
+    ends option parsing, so the workload can use flags that share our names.
+    """
+    opts: List[str] = []
+    i = 0
+
+    # Leading options: run [--name X] [--cpu N] ... <command>
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-h", "--help"):
+            opts.append(tok)
+            i += 1
+        elif tok in RUN_VALUE_OPTIONS:
+            opts.extend(tokens[i:i + 2])   # a missing value is reported by argparse
+            i += 2
+        elif _is_run_option(tok):
+            opts.append(tok)
+            i += 1
+        else:
+            break
+
+    rest = tokens[i:]
+
+    # Explicit separator: everything after `--` is the workload, untouched.
+    if rest and rest[0] == "--":
+        return opts, rest[1:]
+
+    # Trailing options: run <command> [--name X] [--cpu N] ...
+    trailing: List[str] = []
+    while rest:
+        if len(rest) >= 2 and rest[-2] in RUN_VALUE_OPTIONS:
+            trailing = rest[-2:] + trailing
+            rest = rest[:-2]
+        elif _is_run_option(rest[-1]):
+            # `--name=value`, or a dangling `--name` that argparse will reject
+            trailing = rest[-1:] + trailing
+            rest = rest[:-1]
+        else:
+            break
+
+    return opts + trailing, rest
+
+
+def build_command(tokens: List[str]) -> str:
+    """
+    Turns the workload tokens into the single string handed to `/bin/sh -c`.
+
+    One token is a ready-made shell line (`"sleep 1; exit 42"`) and is passed
+    through as-is so pipes, `;` and `&&` keep working. Several tokens are an
+    argv typed word by word; they are re-quoted so each argument reaches the
+    program exactly as typed (e.g. `echo "hello world"` keeps its space).
+    """
+    if len(tokens) == 1:
+        return tokens[0]
+    return shlex.join(tokens)
+
+
+# ============================================================================
 # CLI ENTRYPOINT
 # ============================================================================
-def main():
+def main(argv: Optional[List[str]] = None):
+    if argv is None:
+        argv = sys.argv[1:]
+
     parser = argparse.ArgumentParser(
         prog="containeros",
         description="MiniDocker - Academic Container Management System (OS + DBMS)"
@@ -836,8 +922,17 @@ def main():
     subparsers = parser.add_subparsers(dest="subcommand", help="Available commands")
 
     # run
-    p_run = subparsers.add_parser("run", help="Run a command as a tracked container workload")
-    p_run.add_argument("command", help="Shell command to execute")
+    p_run = subparsers.add_parser(
+        "run",
+        help="Run a command as a tracked container workload",
+        usage="containeros run [-h] [--name NAME] [--cpu CPU] [--memory MEMORY] command [args ...]",
+        epilog="The command can be typed as-is (run sleep 60 --name w1) or quoted as one shell "
+               "line (run \"sleep 1; exit 42\"). Use -- before the command if its own flags "
+               "clash with --name/--cpu/--memory.",
+    )
+    # The workload command is split off by split_run_args() before argparse runs,
+    # so this positional exists for the help text only.
+    p_run.add_argument("command", nargs="*", help="Command to execute, with its arguments")
     p_run.add_argument("--name", help="Friendly name for the container")
     p_run.add_argument("--cpu", type=int, default=0, help="CPU time limit in seconds")
     p_run.add_argument("--memory", type=int, default=0, help="Memory limit in bytes")
@@ -875,7 +970,16 @@ def main():
     p_logs.add_argument("container_id", type=int, help="Target container ID")
     p_logs.add_argument("--output", action="store_true", help="Show process stdout/stderr output log")
 
-    args = parser.parse_args()
+    if argv and argv[0] == "run":
+        # Separate containeros options from the workload command ourselves:
+        # argparse would reject `run sleep 60` or `run ls -la` as unknown arguments.
+        run_opts, command_tokens = split_run_args(argv[1:])
+        args = parser.parse_args(["run"] + run_opts)
+        args.command = build_command(command_tokens) if command_tokens else ""
+        if not args.command.strip():
+            p_run.error("a command to run is required, e.g. containeros run sleep 60 --name worker1")
+    else:
+        args = parser.parse_args(argv)
 
     if not args.subcommand:
         parser.print_help()

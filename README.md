@@ -157,7 +157,7 @@ make -C runtime
 
 | Command | Description | Example |
 | :--- | :--- | :--- |
-| `run` | Launch a tracked background container workload | `python3 cli/containeros.py run "sleep 60" --name worker1 --cpu 10` |
+| `run` | Launch a tracked background container workload | `python3 cli/containeros.py run sleep 60 --name worker1 --cpu 10` |
 | `ps` | List running containers (`-a` for all states) | `python3 cli/containeros.py ps -a` |
 | `inspect` | Display metadata, PID, and live resource telemetry | `python3 cli/containeros.py inspect 1` |
 | `stats` | Display real-time CPU % and Memory RSS consumption | `python3 cli/containeros.py stats [id]` |
@@ -166,6 +166,8 @@ make -C runtime
 | `restart` | Restart a workload with a fresh OS PID | `python3 cli/containeros.py restart 1` |
 | `rm` | Remove container (cascading delete in DB & disk cleanup) | `python3 cli/containeros.py rm 1` |
 | `logs` | View state transition audit trail and process output | `python3 cli/containeros.py logs 1 --output` |
+
+**How `run` reads what you type:** the workload command is taken as typed, so it does not need quotes and can carry its own flags (`run ls -la /tmp --name lister`). `--name`, `--cpu` and `--memory` are recognised before the command or at the end of the line. Quote the command as a single string when it needs shell features (`run "sleep 1; exit 42"`, pipes, `&&`), and put `--` before a command whose own flags clash with ours (`run --name w1 -- mytool --name inner`).
 
 ### 4. Running the Automated Test Suite
 To verify end-to-end lifecycle operations, exit-code capture, and DBMS ACID constraints:

@@ -289,6 +289,90 @@ class TestMiniDockerLifecycle(unittest.TestCase):
         self.assertEqual(ret4, 0)
         self.assertIn("usage: containeros", out4.lower())
 
+    def _run_and_fetch(self, *run_args):
+        """Runs `containeros run ...`, returns the stored DB row, and registers cleanup."""
+        ret, out, err = run_cli("run", *run_args)
+        self.assertEqual(ret, 0, f"run {run_args} failed: {err}")
+        cid = None
+        for line in out.splitlines():
+            if "Container ID" in line:
+                cid = int(line.split(":")[-1].strip())
+                break
+        self.assertIsNotNone(cid, "Container ID not found in CLI output")
+        self.addCleanup(run_cli, "rm", str(cid))
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM containers WHERE container_id = ?", (cid,))
+        return cur.fetchone()
+
+    def test_10_run_command_typed_without_quotes(self):
+        """Test `run` accepts the workload exactly as typed, with options on either side."""
+        stamp = int(time.time() * 1000) % 100000
+
+        # Unquoted command, options after it
+        row = self._run_and_fetch("sleep", "10", "--name", f"test-uq-a-{stamp}", "--cpu", "5")
+        self.assertEqual(row["command"], "sleep 10")
+        self.assertEqual(row["container_name"], f"test-uq-a-{stamp}")
+        self.assertEqual(row["cpu_limit"], 5)
+
+        # Options before the command, --opt=value spelling
+        row = self._run_and_fetch(f"--name=test-uq-b-{stamp}", "--memory", "0", "sleep", "10")
+        self.assertEqual(row["command"], "sleep 10")
+        self.assertEqual(row["container_name"], f"test-uq-b-{stamp}")
+
+        # Workload flags are not mistaken for containeros options
+        row = self._run_and_fetch("ls", "-la", "/tmp", "--name", f"test-uq-c-{stamp}")
+        self.assertEqual(row["command"], "ls -la /tmp")
+
+        # `--` hands everything after it to the workload, even our own option names
+        row = self._run_and_fetch("--name", f"test-uq-d-{stamp}", "--", "echo", "--name", "inner")
+        self.assertEqual(row["command"], "echo --name inner")
+        self.assertEqual(row["container_name"], f"test-uq-d-{stamp}")
+
+        # A quoted one-liner is still passed to the shell untouched
+        row = self._run_and_fetch("sleep 0.1; exit 0", "--name", f"test-uq-e-{stamp}")
+        self.assertEqual(row["command"], "sleep 0.1; exit 0")
+
+    def test_11_run_preserves_argument_boundaries(self):
+        """Test an argument containing spaces reaches the process as one argument."""
+        name = f"test-argv-{int(time.time() * 1000) % 100000}"
+        row = self._run_and_fetch("printf", "[%s]", "hello world", "--name", name)
+        pid = row["pid"]
+        log_path = f"{LOG_DIR}/proc_{pid}.log"
+        content = ""
+        for _ in range(20):
+            if os.path.exists(log_path):
+                with open(log_path) as f:
+                    content = f.read()
+                if content:
+                    break
+            time.sleep(0.1)
+        self.assertEqual(content, "[hello world]")
+
+    def test_12_run_argument_errors(self):
+        """Test `run` rejects a missing command or a dangling option without launching anything."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM containers")
+        before = cur.fetchone()[0]
+
+        ret1, _, err1 = run_cli("run")
+        self.assertEqual(ret1, 2)
+        self.assertIn("command to run is required", err1)
+
+        ret2, _, err2 = run_cli("run", "--name", "only-options")
+        self.assertEqual(ret2, 2)
+        self.assertIn("command to run is required", err2)
+
+        ret3, _, err3 = run_cli("run", "sleep", "10", "--name")
+        self.assertEqual(ret3, 2)
+        self.assertIn("--name", err3)
+
+        ret4, _, err4 = run_cli("run", "sleep", "10", "--cpu", "lots")
+        self.assertEqual(ret4, 2)
+        self.assertIn("--cpu", err4)
+
+        cur.execute("SELECT COUNT(*) FROM containers")
+        self.assertEqual(cur.fetchone()[0], before)
+
 
 if __name__ == "__main__":
     unittest.main()
